@@ -148,6 +148,116 @@ class ArchiveBoundaries(unittest.TestCase):
             self.check_archive(entries, failure='Unexpected dependency requirements')
 
 
+def _piped_installer_pty(script, env, timeout=15):
+    """Run only in a fresh helper: forkpty must not inherit the test runner's state."""
+    import errno
+    import select
+    import signal
+    import time
+
+    reader, writer = os.pipe()
+    pid, master = os.forkpty()
+    if pid == 0:
+        try:
+            os.close(writer)
+            os.tcsetpgrp(0, os.getpgrp())
+            tty = os.open('/dev/tty', os.O_RDWR)
+            assert os.tcgetpgrp(tty) == os.getpgrp()
+            os.close(tty)
+            os.write(1, b'FIXTURE_SLAVE:' + os.ttyname(0).encode() + b'\n')
+            os.dup2(reader, 0)
+            os.close(reader)
+            os.execve(BASH, [BASH, '-s'], env)
+        finally:
+            os._exit(127)
+
+    # The outer watchdog can clean up this exact disposable group if needed.
+    print(pid, file=sys.stderr, flush=True)
+    os.close(reader)
+    slave = None
+    status = None
+    output = b''
+    cancel_sent = False
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline:
+            if select.select([master], [], [], 0.05)[0]:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError as exc:
+                    if exc.errno != errno.EIO:
+                        raise
+                    chunk = b''
+                output += chunk
+                if slave is None and b'FIXTURE_SLAVE:' in output and b'\n' in output:
+                    name = output.split(b'FIXTURE_SLAVE:', 1)[1].split(b'\n', 1)[0].rstrip(b'\r')
+                    # Deliberately hold the slave: completion cannot rely on EOF.
+                    slave = os.open(os.fsdecode(name), os.O_RDWR | os.O_NOCTTY)
+                    os.write(writer, script.encode())
+                    os.close(writer)
+                    writer = None
+                if not cancel_sent and any(line.rstrip(b'\r') == b'SYNTHETIC_READY'
+                                           for line in output.split(b'\n')[:-1]):
+                    os.write(master, b'cancel\n')
+                    cancel_sent = True
+            reaped, child_status = os.waitpid(pid, os.WNOHANG)
+            if reaped:
+                status = child_status
+                # The slave is still held, so drain only currently available data.
+                while time.monotonic() < deadline and select.select([master], [], [], 0)[0]:
+                    output += os.read(master, 4096)
+                return {'returncode': os.waitstatus_to_exitcode(status),
+                        'output': output.decode(errors='replace'), 'cancel_sent': cancel_sent}
+        raise TimeoutError('PTY fixture deadline exceeded: ' + output.decode(errors='replace'))
+    finally:
+        # Native macOS hung reaping a killed child while these PTYs were open.
+        for fd in (writer, slave, master):
+            if fd is not None:
+                os.close(fd)
+        if status is None:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            cleanup_deadline = time.monotonic() + 2
+            while time.monotonic() < cleanup_deadline:
+                if os.waitpid(pid, os.WNOHANG)[0]:
+                    break
+                time.sleep(0.01)
+            else:
+                raise TimeoutError('PTY fixture child was not reaped within cleanup deadline')
+
+
+def _run_piped_installer_pty(script, env, timeout=15):
+    # A fresh interpreter avoids fork-unsafe native state from earlier tests on macOS.
+    entry = ('import importlib.util,json,sys; '
+             'spec=importlib.util.spec_from_file_location("pty_fixture",sys.argv[1]); '
+             'module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module); '
+             'request=json.load(sys.stdin); '
+             'print(json.dumps(module._piped_installer_pty(**request)))')
+    p = subprocess.Popen([sys.executable, '-I', '-c', entry, str(Path(__file__).resolve())],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True)
+    try:
+        stdout, stderr = p.communicate(json.dumps({'script': script, 'env': env, 'timeout': timeout}),
+                                       timeout=timeout + 5)
+        return subprocess.CompletedProcess(p.args, p.returncode, stdout, stderr)
+    except subprocess.TimeoutExpired as exc:
+        import signal
+        # forkpty creates a separate session; kill only its reported disposable group.
+        child_pid = (exc.stderr or b'').splitlines()[:1]
+        if child_pid and child_pid[0].isdigit():
+            try:
+                os.killpg(int(child_pid[0]), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        raise
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.communicate(timeout=2)
+
+
 class InstallerBoundaries(unittest.TestCase):
     def commands(self, root, payload=None, digest=None, consent=True, no_run=True):
         if PS:
@@ -185,53 +295,32 @@ class InstallerBoundaries(unittest.TestCase):
 
     @unittest.skipUnless(BASH, 'native POSIX controlling-terminal test')
     def test_piped_installer_hands_wizard_the_real_terminal(self):
-        import errno
-        import fcntl
-        import pty
-        import select
-        import termios
-        import time
         with tempfile.TemporaryDirectory(prefix='tc tty handoff ') as temp:
             app = Path(temp) / 'app'
             app.mkdir()
-            (app / 'onboard.py').write_text("import sys; assert sys.stdin.isatty() and sys.stdout.isatty(); print('SYNTHETIC_READY', flush=True); assert input() == 'cancel'; print('SYNTHETIC_CANCELLED')\n")
+            (app / 'onboard.py').write_text(
+                "import os, sys, termios, time\n"
+                "assert sys.stdin.isatty() and sys.stdout.isatty()\n"
+                "assert os.tcgetpgrp(sys.stdin.fileno()) == os.getpgrp()\n"
+                # Simulate terminal initialization discarding prematurely typed input.
+                "time.sleep(0.1)\ntermios.tcflush(sys.stdin, termios.TCIFLUSH)\n"
+                "print('SYNTHETIC_READY', flush=True)\n"
+                "assert input() == 'cancel'\nprint('SYNTHETIC_CANCELLED', flush=True)\n")
             text = (REPO / 'install.sh').read_text(encoding='utf-8')
             acquisition = text.split('# bash reading a piped installer', 1)[1].split('[[ "$ROOT"', 1)[0]
             acquisition = acquisition[acquisition.index('\n'):]
             handoff = 'if ((!NO_RUN)); then\n    cleanup\n' + text.split('if ((!NO_RUN)); then\n    cleanup\n', 1)[1]
-            script = 'set -euo pipefail\nNO_RUN=0\nfail(){ printf "%s\\n" "$*" >&2; exit 1; }\ncleanup(){ :; }\n' + acquisition + handoff
-            master, slave = pty.openpty()
-            def own_terminal():
-                os.setsid()
-                fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+            script = ('set -euo pipefail\nNO_RUN=0\n'
+                      'fail(){ printf "%s\\n" "$*" >&2; exit 1; }\ncleanup(){ :; }\n'
+                      '[[ ! -t 0 ]] || fail "installer stdin must be a pipe"\n') + acquisition + handoff
             env = dict(os.environ, PYTHON=sys.executable, APP=str(app), ROOT=str(Path(temp) / 'no data'))
-            p = subprocess.Popen([BASH, '-s'], stdin=subprocess.PIPE, stdout=slave, stderr=slave, env=env, pass_fds=(slave,), preexec_fn=own_terminal)
-            # Keep the slave open so output draining cannot depend on PTY EOF.
-            try:
-                p.stdin.write(script.encode())
-                p.stdin.close()
-                os.write(master, b'cancel\n')
-                p.wait(timeout=15)
-                chunks = []
-                deadline = time.monotonic() + 2
-                while time.monotonic() < deadline:
-                    if not select.select([master], [], [], 0.1)[0]:
-                        break
-                    try:
-                        chunk = os.read(master, 4096)
-                        if not chunk: break
-                        chunks.append(chunk)
-                    except OSError as exc:
-                        if exc.errno != errno.EIO: raise
-                        break
-                output = b''.join(chunks).decode(errors='replace')
-                self.assertEqual(p.returncode, 0, output)
-                self.assertIn('SYNTHETIC_CANCELLED', output)
-                self.assertFalse((Path(temp) / 'no data').exists())
-            finally:
-                if p.poll() is None: p.kill(); p.wait()
-                os.close(slave)
-                os.close(master)
+            p = _run_piped_installer_pty(script, env)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            result = json.loads(p.stdout)
+            self.assertEqual(result['returncode'], 0, result['output'])
+            self.assertTrue(result['cancel_sent'], result['output'])
+            self.assertIn('SYNTHETIC_CANCELLED', result['output'])
+            self.assertFalse((Path(temp) / 'no data').exists())
 
     def test_dangerous_roots_are_refused(self):
         values = ['C:\\'] if PS else ['/', '//', '/tmp/../']
