@@ -57,4 +57,9 @@ jobs:
             PY=.test-venv/bin/python
           fi
           "$PY" -m pip install --only-binary=:all: -r requirements.txt
-          "$PY" -m unittest discover -s tests -v
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            # Fail with a native stack trace instead of waiting for the job timeout.
+            "$PY" -c 'import faulthandler, unittest; faulthandler.dump_traceback_later(120, exit=True); unittest.main(module=None, argv=["unittest", "discover", "-s", "tests", "-v"])'
+          else
+            "$PY" -m unittest discover -s tests -v
+          fi
