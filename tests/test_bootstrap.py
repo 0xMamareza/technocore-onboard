@@ -473,6 +473,12 @@ class FreshInstall(unittest.TestCase):
 
 
 class WorkflowContract(unittest.TestCase):
+    def test_runner_temp_is_only_resolved_in_step_context(self):
+        text = (REPO / '.github/workflows/ci.yml').read_text(encoding='utf-8')
+        job_config, steps = text.split('    steps:', 1)
+        self.assertNotIn('${{ runner.', job_config)
+        self.assertIn('TMPDIR: ${{ runner.temp }}', steps)
+
     def test_ci_covers_native_architectures_and_no_public_actions(self):
         path = REPO / '.github/workflows/ci.yml'
         self.assertTrue(path.is_file(), 'cross-platform workflow is missing')

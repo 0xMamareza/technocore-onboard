@@ -19,7 +19,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       TC_BOOTSTRAP_INTEGRATION: '1'
-      TMPDIR: ${{ runner.temp }}
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -47,6 +46,8 @@ jobs:
           /bin/bash install.sh --plan
       - name: Isolated unit tests, adversarial archives, fresh installs and offline doctor
         shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: |
           set -euo pipefail
           python -m venv .test-venv
