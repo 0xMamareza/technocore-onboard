@@ -1,0 +1,23 @@
+# Local identity/data must never enter source or release payloads.
+*.pem
+*.key
+*.p12
+*.pfx
+.env
+.env.*
+identity/
+receipts/
+state.json
+.posting.lock
+.stage-*
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+releases/
+*.zip
+*.tar.gz
+*.log
+.test-venv/
+SPEC.md

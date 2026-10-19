@@ -1,0 +1,59 @@
+name: Local safety and native bootstrap
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # Public standard labels documented by GitHub; no larger/paid runner requirement.
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-2025, windows-11-arm, macos-15-intel, macos-15]
+    runs-on: ${{ matrix.os }}
+    env:
+      TC_BOOTSTRAP_INTEGRATION: '1'
+      TMPDIR: ${{ runner.temp }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+          # ARM hardware intentionally tests the Windows x64 emulation strategy.
+          architecture: ${{ runner.os == 'Windows' && 'x64' || '' }}
+      - name: Native Windows PowerShell 5.1 syntax and side-effect-free plan
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $tokens = $null; $errors = $null
+          [Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD 'install.ps1'), [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count) { $errors | Format-List; throw 'Installer syntax failed' }
+          .\install.ps1 -Plan
+      - name: POSIX bash syntax and side-effect-free plan
+        if: runner.os != 'Windows'
+        shell: /bin/bash {0}
+        run: |
+          /bin/bash --version
+          /bin/bash -n install.sh
+          /bin/bash install.sh --plan
+      - name: Isolated unit tests, adversarial archives, fresh installs and offline doctor
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv .test-venv
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            PY=.test-venv/Scripts/python.exe
+          else
+            PY=.test-venv/bin/python
+          fi
+          "$PY" -m pip install --only-binary=:all: -r requirements.txt
+          "$PY" -m unittest discover -s tests -v
