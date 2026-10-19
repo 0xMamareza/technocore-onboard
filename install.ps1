@@ -213,6 +213,7 @@ $envValues = @{
     UV_SYSTEM_CERTS = 'true'
 }
 $oldTls = [Net.ServicePointManager]::SecurityProtocol
+$setupError = $null
 try {
     try { $lock = [IO.File]::Open($lockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None) }
     catch { throw 'Installation lock already exists. Ensure no other installer is running; remove only .install.lock after an interrupted install.' }
@@ -275,11 +276,34 @@ try {
     $qWrapper = $wrapper.Replace("'", "''")
     Write-Output "Contribute: powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$qWrapper' contribute"
     Write-Output "Doctor: powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$qWrapper' doctor"
+} catch {
+    $setupError = $_
+    throw
 } finally {
-    foreach ($key in $oldEnv.Keys) { [Environment]::SetEnvironmentVariable($key, $oldEnv[$key], 'Process') }
-    [Net.ServicePointManager]::SecurityProtocol = $oldTls
-    if ($stage -and (Test-Path -LiteralPath $stage)) { Remove-Item -LiteralPath $stage -Recurse -Force }
-    if ($lock) { $lock.Dispose(); Remove-Item -LiteralPath $lockPath -Force }
+    try {
+        try {
+            foreach ($key in $oldEnv.Keys) { [Environment]::SetEnvironmentVariable($key, $oldEnv[$key], 'Process') }
+            [Net.ServicePointManager]::SecurityProtocol = $oldTls
+            if ($stage -and (Test-Path -LiteralPath $stage)) {
+                # Windows may briefly retain an image mapping after uv exits.
+                for ($attempt = 1; $attempt -le 20; $attempt++) {
+                    try { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction Stop; break }
+                    catch {
+                        if ($attempt -eq 20) { throw }
+                        Start-Sleep -Milliseconds 250
+                    }
+                }
+            }
+        } finally {
+            if ($lock) {
+                try { $lock.Dispose() }
+                finally { Remove-Item -LiteralPath $lockPath -Force -ErrorAction Stop }
+            }
+        }
+    } catch {
+        if (!$setupError) { throw }
+        Write-Warning -WarningAction Continue "Installer cleanup also failed: $($_.Exception.Message)"
+    }
 }
 if (!$NoRun) {
     & $python -B -E -s (Join-Path $app 'onboard.py') --data-dir $Root setup

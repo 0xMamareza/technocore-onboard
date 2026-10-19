@@ -631,13 +631,20 @@ class WizardTests(unittest.TestCase):
             listener.settimeout(3)
             address = listener.getsockname()
             stopped, errors = threading.Event(), []
+            tls_established, headers_started = threading.Event(), threading.Event()
+            self.assertTrue(client_tls.check_hostname)
+            self.assertEqual(client_tls.verify_mode, ssl.CERT_REQUIRED)
             def serve():
                 try:
                     peer, _ = listener.accept()
                     peer.settimeout(3)
                     with server_tls.wrap_socket(peer, server_side=True) as stream:
-                        stream.recv(8192)
+                        tls_established.set()
+                        request = stream.recv(8192)
+                        if not request.startswith(b'GET /r/lobby?limit=200&format=json HTTP/1.1\r\n'):
+                            raise AssertionError('Expected the read-only request over verified TLS')
                         stream.sendall(b'HTTP/1.1 200 OK\r\nX-Slow: ')
+                        headers_started.set()
                         for _ in range(30):
                             if stopped.wait(.04):
                                 return
@@ -654,25 +661,47 @@ class WizardTests(unittest.TestCase):
             def local_connection(target, *args, **kwargs):
                 connections.append(target)
                 return create_connection(address, *args, **kwargs)
+            handler_init = urllib.request.HTTPSHandler.__init__
+            def trusted_handler_init(handler, *args, **kwargs):
+                # Avoid loading then discarding system trust inside the timed request.
+                handler_init(handler, *args, context=client_tls, **kwargs)
             def trusted_opener(*handlers):
-                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), *handlers)
-                for handler in opener.handlers:
-                    if isinstance(handler, urllib.request.HTTPSHandler):
-                        handler._context = client_tls
-                return opener
+                return urllib.request.build_opener(urllib.request.ProxyHandler({}), *handlers)
             started = time.monotonic()
             try:
-                with patch('onboard.build_opener', side_effect=trusted_opener), patch('socket.create_connection', side_effect=local_connection):
+                with patch.object(urllib.request.HTTPSHandler, '__init__', trusted_handler_init), patch('onboard.build_opener', side_effect=trusted_opener), patch('socket.create_connection', side_effect=local_connection):
                     with self.assertRaises((TimeoutError, urllib.error.URLError)):
                         app.http_request('GET', 'https://technocore.chat/r/lobby?limit=200&format=json', timeout=.25)
                 self.assertLess(time.monotonic() - started, .8, 'Slow headers exceeded the total HTTP deadline')
                 self.assertEqual(len(connections), 1, 'Never retry a timed-out request')
+                self.assertTrue(tls_established.is_set(), 'Verified TLS handshake never completed')
+                self.assertTrue(headers_started.is_set(), 'Slow response headers never started')
             finally:
                 stopped.set()
                 listener.close()
                 worker.join(timeout=4)
             self.assertFalse(worker.is_alive(), 'Disposable test server did not stop')
             self.assertEqual(errors, [])
+
+    def test_http_deadline_exhausted_during_handler_init_never_connects(self):
+        import socket
+        import urllib.error
+        import urllib.request
+        from unittest.mock import patch
+        clock = [0.0]
+        deadline_handler = app.DeadlineHTTPSHandler
+        def slow_handler_init(deadline):
+            handler = deadline_handler(deadline)
+            clock[0] = .26  # Deterministic setup cost exhausts the .25-second budget.
+            return handler
+        def direct_opener(*handlers):
+            return urllib.request.build_opener(urllib.request.ProxyHandler({}), *handlers)
+        with patch('onboard.time.monotonic', side_effect=lambda: clock[0]), patch('onboard.DeadlineHTTPSHandler', side_effect=slow_handler_init), patch('onboard.build_opener', side_effect=direct_opener), patch.object(socket, 'create_connection', side_effect=OSError('SYNTHETIC forbidden socket attempt')) as connect:
+            with self.assertRaises(urllib.error.URLError) as error:
+                app.http_request('GET', 'https://technocore.chat/r/lobby?limit=200&format=json', timeout=.25)
+        connect.assert_not_called()
+        self.assertIsInstance(error.exception.reason, TimeoutError)
+        self.assertEqual(str(error.exception.reason), 'HTTP deadline exceeded')
 
     def test_http_stream_enforces_cap_and_remaining_deadline(self):
         from unittest.mock import patch

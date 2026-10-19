@@ -188,7 +188,9 @@ class InstallerBoundaries(unittest.TestCase):
         import errno
         import fcntl
         import pty
+        import select
         import termios
+        import time
         with tempfile.TemporaryDirectory(prefix='tc tty handoff ') as temp:
             app = Path(temp) / 'app'
             app.mkdir()
@@ -204,14 +206,17 @@ class InstallerBoundaries(unittest.TestCase):
                 fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
             env = dict(os.environ, PYTHON=sys.executable, APP=str(app), ROOT=str(Path(temp) / 'no data'))
             p = subprocess.Popen([BASH, '-s'], stdin=subprocess.PIPE, stdout=slave, stderr=slave, env=env, pass_fds=(slave,), preexec_fn=own_terminal)
-            os.close(slave)
+            # Keep the slave open so output draining cannot depend on PTY EOF.
             try:
                 p.stdin.write(script.encode())
                 p.stdin.close()
                 os.write(master, b'cancel\n')
                 p.wait(timeout=15)
                 chunks = []
-                while True:
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    if not select.select([master], [], [], 0.1)[0]:
+                        break
                     try:
                         chunk = os.read(master, 4096)
                         if not chunk: break
@@ -225,6 +230,7 @@ class InstallerBoundaries(unittest.TestCase):
                 self.assertFalse((Path(temp) / 'no data').exists())
             finally:
                 if p.poll() is None: p.kill(); p.wait()
+                os.close(slave)
                 os.close(master)
 
     def test_dangerous_roots_are_refused(self):
@@ -432,6 +438,108 @@ class InstallerBoundaries(unittest.TestCase):
                 self.assertIn('unmanaged', (p.stdout + p.stderr).lower())
                 self.assertEqual(sentinel.read_bytes(), b'do not touch')
                 self.assertEqual(list(root.iterdir()), [sentinel])
+
+
+@unittest.skipUnless(PS, 'native Windows image-mapping cleanup regression')
+class WindowsStageCleanup(unittest.TestCase):
+    def check_cleanup(self, release, primary_error=False):
+        import ctypes
+        from ctypes import wintypes as w
+        import time
+
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.CreateFileW.argtypes = [w.LPCWSTR, w.DWORD, w.DWORD, w.LPVOID, w.DWORD, w.DWORD, w.HANDLE]
+        kernel.CreateFileW.restype = w.HANDLE
+        kernel.CreateFileMappingW.argtypes = [w.HANDLE, w.LPVOID, w.DWORD, w.DWORD, w.DWORD, w.LPCWSTR]
+        kernel.CreateFileMappingW.restype = w.HANDLE
+        kernel.MapViewOfFile.argtypes = [w.HANDLE, w.DWORD, w.DWORD, w.DWORD, ctypes.c_size_t]
+        kernel.MapViewOfFile.restype = w.LPVOID
+        kernel.UnmapViewOfFile.argtypes = [w.LPCVOID]
+        kernel.CloseHandle.argtypes = [w.HANDLE]
+        with tempfile.TemporaryDirectory(prefix='tc mapped cleanup ') as temp:
+            root = Path(temp)
+            stage = root / '.stage-fixture'
+            (stage / 'uv').mkdir(parents=True)
+            exe = stage / 'uv/uv.exe'
+            # Map a disposable real PE image; no uv download or execution is needed.
+            shutil.copyfile(Path(sys.base_prefix) / 'python.exe', exe)
+            sentinel = root / 'identity-sentinel'
+            sentinel.write_bytes(b'unrelated data must survive')
+            lock_path, ready = root / '.install.lock', root / 'cleanup-ready'
+            quote = lambda value: "'" + str(value).replace("'", "''") + "'"
+            text = (REPO / 'install.ps1').read_text(encoding='utf-8')
+            # Keep the production catch/finally intact; substitute only the download/setup body.
+            lifecycle = text.split('$oldTls = ', 1)[1].split('\nif (!$NoRun)', 1)[0]
+            lifecycle = '$oldTls = ' + lifecycle
+            body_start = lifecycle.index('\ntry {\n') + len('\ntry {\n')
+            doctor = lifecycle.index('    Write-Output "Doctor:')
+            body_end = lifecycle.index('\n', doctor)
+            body = ('    $lock = [IO.File]::Open($lockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)\n'
+                    '    try { [IO.File]::Delete(' + quote(exe) + "); throw 'Image was not contended' }\n"
+                    "    catch [UnauthorizedAccessException] { Write-Output 'IMAGE_DELETE_DENIED' }\n"
+                    '    [IO.File]::WriteAllText(' + quote(ready) + ", 'ready')\n")
+            if primary_error:
+                body += "    throw 'PRIMARY_SETUP_FAILURE'\n"
+            lifecycle = lifecycle[:body_start] + body + lifecycle[body_end:]
+            code = ("$ErrorActionPreference='Stop'; $oldEnv=@{}; $lock=$null; $stage=" + quote(stage)
+                    + '; $lockPath=' + quote(lock_path)
+                    + '\ntry {\n' + lifecycle + "\n} catch { Write-Output ('CAUGHT_ERROR=' + $_.Exception.Message); exit 23 }\n")
+            script = root / 'cleanup.ps1'
+            script.write_text(code, encoding='utf-8-sig')
+            file = section = view = None
+            proc = None
+            try:
+                file = kernel.CreateFileW(str(exe), 0x80000000, 7, None, 3, 0, None)
+                self.assertNotEqual(file, ctypes.c_void_p(-1).value, ctypes.get_last_error())
+                section = kernel.CreateFileMappingW(file, None, 0x1000000 | 2, 0, 0, None)  # SEC_IMAGE | PAGE_READONLY
+                self.assertTrue(section, ctypes.get_last_error())
+                view = kernel.MapViewOfFile(section, 4, 0, 0, 0)
+                self.assertTrue(view, ctypes.get_last_error())
+                kernel.CloseHandle(file); file = None
+                kernel.CloseHandle(section); section = None
+                started = time.monotonic()
+                proc = subprocess.Popen([PS, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(script)],
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors='replace')
+                deadline = started + 15
+                while not ready.exists() and proc.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                if release and ready.exists():
+                    time.sleep(0.5)
+                    self.assertTrue(kernel.UnmapViewOfFile(view), ctypes.get_last_error())
+                    view = None
+                stdout, stderr = proc.communicate(timeout=15)
+                elapsed = time.monotonic() - started
+                output = stdout + stderr
+                self.assertIn('IMAGE_DELETE_DENIED', output, output)
+                self.assertTrue(ready.exists(), output)
+                self.assertEqual(sentinel.read_bytes(), b'unrelated data must survive')
+                self.assertLess(elapsed, 12, output)
+                self.assertFalse(lock_path.exists(), output)
+                if release:
+                    self.assertEqual(proc.returncode, 0, output)
+                    self.assertFalse(stage.exists(), output)
+                else:
+                    self.assertNotEqual(proc.returncode, 0, output)
+                    self.assertTrue(exe.exists(), output)
+                    self.assertIn('Access', output, output)
+                if primary_error:
+                    self.assertIn('CAUGHT_ERROR=PRIMARY_SETUP_FAILURE', output, output)
+                    self.assertIn('WARNING:', output, 'secondary cleanup failure must remain visible')
+            finally:
+                if proc is not None and proc.poll() is None:
+                    proc.kill(); proc.communicate(timeout=10)
+                if view: kernel.UnmapViewOfFile(view)
+                if section: kernel.CloseHandle(section)
+                if file and file != ctypes.c_void_p(-1).value: kernel.CloseHandle(file)
+
+    def test_transient_image_mapping_retries_then_removes_stage_and_lock(self):
+        self.check_cleanup(release=True)
+
+    def test_persistent_image_mapping_fails_bounded_but_removes_lock(self):
+        self.check_cleanup(release=False)
+
+    def test_primary_setup_error_survives_persistent_cleanup_failure(self):
+        self.check_cleanup(release=False, primary_error=True)
 
 
 @unittest.skipUnless(os.environ.get('TC_BOOTSTRAP_INTEGRATION') == '1', 'opt-in network downloads: TC_BOOTSTRAP_INTEGRATION=1')
